@@ -2,17 +2,20 @@
 """
 MCP Server for Trade Database
 
-Provides Claude Code access to production trade.db on Mac mini via SSH.
-Enables querying open positions, portfolio state, and recent trades.
+Provides Claude Code access to production trade.db.
+Supports two modes:
+  - Local mode: Direct SQLite access (when running on Mac mini)
+  - Remote mode: SSH proxy to Mac mini (when running on Mac Studio)
 
-Architecture: SSH proxy pattern - MCP server runs on Mac Studio,
-queries Mac mini trade.db via SSH for live production data.
+Set LOCAL_MODE=true environment variable for direct database access.
 """
 
 import os
 import asyncio
+import sqlite3
 from typing import Any, Optional
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -28,9 +31,47 @@ from pydantic import AnyUrl
 MACMINI_HOST = os.environ.get("MACMINI_HOST", "100.102.226.1")
 SSH_KEY_PATH = os.environ.get("SSH_KEY_PATH", "/Users/urban/.ssh/macmini")
 TRADE_DB_PATH = os.environ.get("TRADE_DB_PATH", "~/Public/trading-lab/data/trade.db")
+LOCAL_MODE = os.environ.get("LOCAL_MODE", "false").lower() == "true"
 
 # Initialize MCP server
 server = Server("trade-db")
+
+
+def get_local_db_path() -> str:
+    """Expand and resolve the local database path."""
+    path = os.path.expanduser(TRADE_DB_PATH)
+    return str(Path(path).resolve())
+
+
+async def execute_local_query(sql: str) -> str:
+    """Execute SQL query directly on local SQLite database."""
+    db_path = get_local_db_path()
+
+    if not os.path.exists(db_path):
+        raise RuntimeError(f"Database not found: {db_path}")
+
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(sql)
+
+        # Get column names
+        columns = [description[0] for description in cursor.description] if cursor.description else []
+        rows = cursor.fetchall()
+        conn.close()
+
+        if not columns:
+            return ""
+
+        # Format as pipe-separated output (matching SSH output format)
+        lines = ['|'.join(columns)]
+        for row in rows:
+            lines.append('|'.join(str(v) if v is not None else '' for v in row))
+
+        return '\n'.join(lines)
+
+    except sqlite3.Error as e:
+        raise RuntimeError(f"SQLite error: {e}")
 
 
 async def execute_remote_query(sql: str) -> str:
@@ -67,6 +108,14 @@ async def execute_remote_query(sql: str) -> str:
         raise RuntimeError(f"SSH query failed: {error_msg}")
 
     return stdout.decode()
+
+
+async def execute_query(sql: str) -> str:
+    """Execute SQL query using appropriate method (local or remote)."""
+    if LOCAL_MODE:
+        return await execute_local_query(sql)
+    else:
+        return await execute_remote_query(sql)
 
 
 def parse_pipe_output(output: str) -> list[dict]:
@@ -295,7 +344,7 @@ async def handle_get_open_positions(args: dict) -> list[TextContent]:
     LIMIT {limit}
     """
 
-    output = await execute_remote_query(sql)
+    output = await execute_query(sql)
     positions = parse_pipe_output(output)
 
     if not positions:
@@ -347,7 +396,7 @@ async def handle_get_portfolio_summary(args: dict) -> list[TextContent]:
     LIMIT 1
     """
 
-    output = await execute_remote_query(sql)
+    output = await execute_query(sql)
     results = parse_pipe_output(output)
 
     if not results:
@@ -364,7 +413,7 @@ async def handle_get_portfolio_summary(args: dict) -> list[TextContent]:
         AND timing_mode = '{timing_mode}'
         AND shares IS NOT NULL
     """
-    exec_output = await execute_remote_query(exec_sql)
+    exec_output = await execute_query(exec_sql)
     exec_results = parse_pipe_output(exec_output)
     executed_count = exec_results[0]['count'] if exec_results else 0
 
@@ -420,7 +469,7 @@ async def handle_get_pending_exits(args: dict) -> list[TextContent]:
     ORDER BY exit_date ASC, symbol_code ASC
     """
 
-    output = await execute_remote_query(sql)
+    output = await execute_query(sql)
     positions = parse_pipe_output(output)
 
     if not positions:
@@ -479,7 +528,7 @@ async def handle_get_recent_trades(args: dict) -> list[TextContent]:
     LIMIT {limit}
     """
 
-    output = await execute_remote_query(sql)
+    output = await execute_query(sql)
     trades = parse_pipe_output(output)
 
     if not trades:
@@ -555,7 +604,7 @@ async def handle_get_position_details(args: dict) -> list[TextContent]:
     LIMIT 5
     """
 
-    output = await execute_remote_query(sql)
+    output = await execute_query(sql)
     positions = parse_pipe_output(output)
 
     if not positions:
@@ -609,7 +658,7 @@ async def handle_get_database_status(args: dict) -> list[TextContent]:
             (SELECT MAX(entry_date) FROM strategy_positions) as latest_entry
         """
 
-        output = await execute_remote_query(sql)
+        output = await execute_query(sql)
         results = parse_pipe_output(output)
 
         if not results:
@@ -617,9 +666,15 @@ async def handle_get_database_status(args: dict) -> list[TextContent]:
 
         stats = results[0]
 
+        # Determine connection mode for status display
+        if LOCAL_MODE:
+            conn_status = f"OK (local: {get_local_db_path()})"
+        else:
+            conn_status = f"OK (via SSH to {MACMINI_HOST})"
+
         lines = [
             "Trade Database Status",
-            f"Connection: OK (via SSH to {MACMINI_HOST})",
+            f"Connection: {conn_status}",
             "",
             "Statistics:",
             f"  Open Positions (executed): {stats.get('open_executed', 0)}",
