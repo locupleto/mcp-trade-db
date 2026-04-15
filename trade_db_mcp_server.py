@@ -404,20 +404,25 @@ async def handle_get_portfolio_summary(args: dict) -> list[TextContent]:
 
     state = results[0]
 
-    # Also get executed position count
-    exec_sql = f"""
-    SELECT COUNT(*) as count
+    # Count executed positions (actually bought) and pending signals (declined or not yet filled)
+    count_sql = f"""
+    SELECT
+        SUM(CASE WHEN shares IS NOT NULL THEN 1 ELSE 0 END) as executed,
+        SUM(CASE WHEN shares IS NULL THEN 1 ELSE 0 END) as pending
     FROM strategy_positions
     WHERE status = 'open'
         AND strategy_id = 'adm_momentum'
         AND timing_mode = '{timing_mode}'
-        AND shares IS NOT NULL
     """
-    exec_output = await execute_query(exec_sql)
-    exec_results = parse_pipe_output(exec_output)
-    executed_count = exec_results[0]['count'] if exec_results else 0
+    count_output = await execute_query(count_sql)
+    count_results = parse_pipe_output(count_output)
+    executed_count = int(count_results[0]['executed'] or 0) if count_results else 0
+    pending_count = int(count_results[0]['pending'] or 0) if count_results else 0
+    max_positions = state.get('max_positions', 'N/A')
 
-    # Format output
+    # Format output — matches Open Positions UI ("54 / 60") as primary number.
+    # Pending signals (shares IS NULL) are listed separately; the UI hides these,
+    # so they MUST NOT be conflated with executed positions in reconciliations.
     lines = [
         f"Portfolio Summary ({timing_mode.title()} Mode)",
         f"As of: {state.get('state_date', 'N/A')}",
@@ -428,8 +433,8 @@ async def handle_get_portfolio_summary(args: dict) -> list[TextContent]:
         f"  Positions Value:  {format_currency(state.get('positions_value'))}",
         "",
         "Positions:",
-        f"  Open Positions:   {executed_count} executed of {state.get('num_open_positions', 'N/A')} total",
-        f"  Max Allowed:      {state.get('max_positions', 'N/A')}",
+        f"  Open (executed):  {executed_count} / {max_positions}   (matches Open Positions page)",
+        f"  Pending signals:  {pending_count}   (shares=NULL: declined in UI or awaiting fill)",
         "",
         f"Today's Activity:",
         f"  Entries:          {state.get('trades_entered_today', 0)}",
