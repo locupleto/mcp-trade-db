@@ -154,6 +154,45 @@ def format_currency(value: Optional[float]) -> str:
     return f"${value:,.2f}"
 
 
+def business_days_between(start_iso: str, end_iso: str) -> int:
+    """Count business days (Mon-Fri) between start and end, exclusive of start.
+
+    Holidays not accounted for — accuracy sufficient for phantom-warning aging
+    (rule uses bdays >= 3, and holidays shift count by at most 1-2 days).
+    """
+    try:
+        start = datetime.fromisoformat(start_iso[:10])
+        end = datetime.fromisoformat(end_iso[:10])
+    except (ValueError, TypeError):
+        return 0
+    if end <= start:
+        return 0
+    days = 0
+    current = start + timedelta(days=1)
+    while current <= end:
+        if current.weekday() < 5:  # 0-4 = Mon-Fri
+            days += 1
+        current += timedelta(days=1)
+    return days
+
+
+def phantom_glyph(warning_first_date: Optional[str]) -> str:
+    """Return glyph for a position's phantom-warning state.
+
+    - '✅' if no phantom warning (clean)
+    - '👻' if phantom warning is recent (< 3 business days old)
+    - '🔴' if phantom warning is persistent (>= 3 business days old)
+
+    Full 3-condition rule (persistence + in-the-red + deteriorating) is
+    applied by the TradeBot pre-close alert which has live market prices;
+    here we only age by the persistence leg since MCP lacks current_price.
+    """
+    if not warning_first_date:
+        return '✅'
+    bdays = business_days_between(warning_first_date, datetime.now().isoformat())
+    return '🔴' if bdays >= 3 else '👻'
+
+
 def format_pct(value: Optional[float], decimals: int = 2) -> str:
     """Format a percentage value."""
     if value is None:
@@ -334,7 +373,8 @@ async def handle_get_open_positions(args: dict) -> list[TextContent]:
         ROUND(5.0, 2) as unrealized_pnl_pct,
         exit_date,
         exit_reason,
-        duration_days
+        duration_days,
+        phantom_warning_first_date
     FROM strategy_positions
     WHERE status = 'open'
         AND strategy_id = 'adm_momentum'
@@ -351,7 +391,11 @@ async def handle_get_open_positions(args: dict) -> list[TextContent]:
         return [TextContent(type="text", text="No open positions found.")]
 
     # Format output
-    lines = [f"Open Positions ({len(positions)} found):", ""]
+    phantom_count = sum(1 for p in positions if p.get('phantom_warning_first_date'))
+    header = f"Open Positions ({len(positions)} found)"
+    if phantom_count:
+        header += f" — {phantom_count} with phantom warnings"
+    lines = [header + ":", ""]
 
     for pos in positions:
         symbol = pos.get('symbol_code', 'N/A')
@@ -360,14 +404,18 @@ async def handle_get_open_positions(args: dict) -> list[TextContent]:
         entry_price = format_currency(pos.get('entry_price'))
         shares = pos.get('shares', 'N/A')
         entry_value = format_currency(pos.get('entry_value'))
+        warning_date = pos.get('phantom_warning_first_date')
+        glyph = phantom_glyph(warning_date)
 
         # Check for pending exit
         exit_marker = ""
         if pos.get('exit_date'):
             exit_marker = f" [EXIT PENDING: {pos.get('exit_reason', 'signal')}]"
 
-        lines.append(f"  {symbol} ({timing}): {shares} shares @ {entry_price}")
+        lines.append(f"  {glyph} {symbol} ({timing}): {shares} shares @ {entry_price}")
         lines.append(f"    Entry: {entry_date}, Value: {entry_value}{exit_marker}")
+        if warning_date:
+            lines.append(f"    Phantom warning since {warning_date}")
 
     return [TextContent(type="text", text="\n".join(lines))]
 
@@ -420,6 +468,25 @@ async def handle_get_portfolio_summary(args: dict) -> list[TextContent]:
     pending_count = int(count_results[0]['pending'] or 0) if count_results else 0
     max_positions = state.get('max_positions', 'N/A')
 
+    # Count executed positions with active phantom-entry warnings
+    phantom_sql = f"""
+    SELECT symbol_code, phantom_warning_first_date
+    FROM strategy_positions
+    WHERE status = 'open'
+        AND shares IS NOT NULL
+        AND strategy_id = 'adm_momentum'
+        AND timing_mode = '{timing_mode}'
+        AND phantom_warning_first_date IS NOT NULL
+    ORDER BY phantom_warning_first_date ASC
+    """
+    phantom_output = await execute_query(phantom_sql)
+    phantom_rows = parse_pipe_output(phantom_output)
+    phantom_total = len(phantom_rows)
+    phantom_persistent = sum(
+        1 for r in phantom_rows
+        if business_days_between(r.get('phantom_warning_first_date', ''), datetime.now().isoformat()) >= 3
+    )
+
     # Format output — matches Open Positions UI ("54 / 60") as primary number.
     # Pending signals (shares IS NULL) are listed separately; the UI hides these,
     # so they MUST NOT be conflated with executed positions in reconciliations.
@@ -435,13 +502,23 @@ async def handle_get_portfolio_summary(args: dict) -> list[TextContent]:
         "Positions:",
         f"  Open (executed):  {executed_count} / {max_positions}   (matches Open Positions page)",
         f"  Pending signals:  {pending_count}   (shares=NULL: declined in UI or awaiting fill)",
+    ]
+
+    if phantom_total:
+        lines.append(
+            f"  Phantom warnings: {phantom_total} total "
+            f"(🔴 {phantom_persistent} persistent ≥3 bdays, "
+            f"👻 {phantom_total - phantom_persistent} recent)"
+        )
+
+    lines.extend([
         "",
         f"Today's Activity:",
         f"  Entries:          {state.get('trades_entered_today', 0)}",
         f"  Exits:            {state.get('trades_exited_today', 0)}",
         f"  Cash Deployed:    {format_currency(state.get('cash_deployed_today'))}",
         f"  Cash Freed:       {format_currency(state.get('cash_freed_today'))}",
-    ]
+    ])
 
     return [TextContent(type="text", text="\n".join(lines))]
 
@@ -599,6 +676,8 @@ async def handle_get_position_details(args: dict) -> list[TextContent]:
         status,
         pnl_pct,
         duration_days,
+        phantom_warning_first_date,
+        phantom_warning_close_at_first,
         created_at,
         updated_at
     FROM strategy_positions
@@ -624,8 +703,13 @@ async def handle_get_position_details(args: dict) -> list[TextContent]:
         entry_price = format_currency(pos.get('entry_price'))
         shares = pos.get('shares')
         entry_value = format_currency(pos.get('entry_value'))
+        warning_date = pos.get('phantom_warning_first_date')
+        glyph = phantom_glyph(warning_date) if pos.get('status') == 'open' else ''
 
-        lines.append(f"[{status}] {timing} Mode")
+        header = f"[{status}] {timing} Mode"
+        if glyph:
+            header = f"{glyph} {header}"
+        lines.append(header)
         lines.append(f"  Entry: {entry_date} @ {entry_price}")
 
         if shares:
@@ -634,6 +718,12 @@ async def handle_get_position_details(args: dict) -> list[TextContent]:
             lines.append(f"  (Signal only - not executed)")
 
         lines.append(f"  Entry Reason: {pos.get('entry_reason', 'N/A')}")
+
+        if warning_date and pos.get('status') == 'open':
+            bdays = business_days_between(warning_date, datetime.now().isoformat())
+            close_at_warn = pos.get('phantom_warning_close_at_first')
+            extra = f", close on warning day: {format_currency(close_at_warn)}" if close_at_warn else ""
+            lines.append(f"  Phantom warning: {warning_date} ({bdays} bdays ago{extra})")
 
         if pos.get('status') == 'closed':
             exit_price = format_currency(pos.get('exit_price'))
