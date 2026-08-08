@@ -23,8 +23,12 @@ from mcp.types import (
     Tool,
     TextContent,
     Resource,
+    CallToolResult,
+    ListToolsResult,
+    ListResourcesResult,
+    ReadResourceResult,
+    TextResourceContents,
 )
-from pydantic import AnyUrl
 
 
 # Environment variables
@@ -32,9 +36,6 @@ MACMINI_HOST = os.environ.get("MACMINI_HOST", "100.102.226.1")
 SSH_KEY_PATH = os.environ.get("SSH_KEY_PATH", "/Users/urban/.ssh/macmini")
 TRADE_DB_PATH = os.environ.get("TRADE_DB_PATH", "~/Public/trading-lab/data/trade.db")
 LOCAL_MODE = os.environ.get("LOCAL_MODE", "false").lower() == "true"
-
-# Initialize MCP server
-server = Server("trade-db")
 
 
 def get_local_db_path() -> str:
@@ -200,7 +201,6 @@ def format_pct(value: Optional[float], decimals: int = 2) -> str:
     return f"{value:.{decimals}f}%"
 
 
-@server.list_tools()
 async def list_tools() -> list[Tool]:
     """List available tools."""
     return [
@@ -315,7 +315,6 @@ async def list_tools() -> list[Tool]:
     ]
 
 
-@server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Handle tool calls."""
     handlers = {
@@ -788,18 +787,17 @@ async def handle_get_database_status(args: dict) -> list[TextContent]:
 
 
 # Resources
-@server.list_resources()
 async def list_resources() -> list[Resource]:
     """List available resources."""
     return [
         Resource(
-            uri=AnyUrl("trade://status"),
+            uri="trade://status",
             name="Database Status",
             description="Trade database connection status and statistics",
             mimeType="text/plain"
         ),
         Resource(
-            uri=AnyUrl("trade://portfolio"),
+            uri="trade://portfolio",
             name="Portfolio Summary",
             description="Current portfolio holdings summary",
             mimeType="text/plain"
@@ -807,8 +805,7 @@ async def list_resources() -> list[Resource]:
     ]
 
 
-@server.read_resource()
-async def read_resource(uri: AnyUrl) -> str:
+async def read_resource(uri: str) -> str:
     """Read a resource."""
     uri_str = str(uri)
     if uri_str == "trade://status":
@@ -819,6 +816,53 @@ async def read_resource(uri: AnyUrl) -> str:
         return result[0].text
     else:
         raise ValueError(f"Unknown resource: {uri_str}")
+
+
+# --- MCP SDK 2.x adapters ----------------------------------------------------
+# list_tools()/call_tool()/list_resources()/read_resource() above keep their
+# v1 signatures so tests and scripts can import and call them directly. These
+# thin adapters bridge them to the SDK 2.x handler contract (ctx/params in,
+# *Result models out) and restore v1 error semantics: any exception from the
+# legacy tool handler becomes CallToolResult(is_error=True, text=str(e)) —
+# readable by the model — instead of an opaque JSON-RPC internal error.
+
+async def _on_list_tools(ctx, params) -> ListToolsResult:
+    return ListToolsResult(tools=await list_tools())
+
+
+async def _on_call_tool(ctx, params) -> CallToolResult:
+    try:
+        content = await call_tool(params.name, params.arguments or {})
+        return CallToolResult(content=list(content), is_error=False)
+    except Exception as e:
+        return CallToolResult(
+            content=[TextContent(type="text", text=str(e))],
+            is_error=True,
+        )
+
+
+async def _on_list_resources(ctx, params) -> ListResourcesResult:
+    return ListResourcesResult(resources=await list_resources())
+
+
+async def _on_read_resource(ctx, params) -> ReadResourceResult:
+    # v1 auto-wrapped a returned str as text/plain contents; reproduce that.
+    text = await read_resource(params.uri)
+    return ReadResourceResult(
+        contents=[
+            TextResourceContents(uri=params.uri, mime_type="text/plain", text=text)
+        ]
+    )
+
+
+server = Server(
+    "trade-db",
+    version="1.0.0",
+    on_list_tools=_on_list_tools,
+    on_call_tool=_on_call_tool,
+    on_list_resources=_on_list_resources,
+    on_read_resource=_on_read_resource,
+)
 
 
 async def main():
